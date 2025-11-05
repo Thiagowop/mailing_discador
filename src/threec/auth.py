@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import requests  # type: ignore[import-untyped]
+from dotenv import load_dotenv
 from requests import Response, Session  # type: ignore[import-untyped]
 from requests.exceptions import RequestException, Timeout  # type: ignore[import-untyped]
 
@@ -75,7 +76,6 @@ class Credentials:
 class ThreeCAuthClient:
     """Cliente responsável por autenticação na API 3C Plus."""
 
-    DEFAULT_BASE_URL = "http://app.3c.fluxoti.com.br/api/v1"
 
     def __init__(
         self,
@@ -85,16 +85,28 @@ class ThreeCAuthClient:
         max_retries: int = 3,
         session: Optional[Session] = None,
     ) -> None:
-        self.base_url = (
-            base_url
-            or os.getenv("THREEC_BASE_URL")
-            or self.DEFAULT_BASE_URL
-        ).rstrip("/")
+        # Carregar variáveis do ambiente (.env)
+        load_dotenv()
+        raw_base = base_url or os.getenv("THREECPLUS_BASE_URL")
+        if not raw_base:
+            # Fail-Fast: sem fallback de URL
+            raise InputInvalid(
+                "BASE_URL ausente: defina THREECPLUS_BASE_URL no .env ou passe base_url no construtor"
+            )
+        raw_base = raw_base.rstrip("/")
+        # Garantir sufixo /api/v1
+        self.base_url = raw_base if raw_base.endswith("/api/v1") else f"{raw_base}/api/v1"
         self.timeout = timeout
         self.max_retries = max_retries
         self.session = session or requests.Session()
         self.session.headers.update({"Accept": "application/json"})
+        # Token: usar do ambiente apenas se nenhum base_url explícito foi passado
         self._token: Optional[str] = None
+        if base_url is None:
+            token_env = os.getenv("THREECPLUS_API_TOKEN")
+            if token_env:
+                self._token = token_env
+                self.session.headers.update({"Authorization": f"Bearer {token_env}"})
         self.logger = logging.getLogger(self.__class__.__name__)
 
     # ------------------------------------------------------------------
@@ -110,12 +122,13 @@ class ThreeCAuthClient:
         """Obtém credenciais a partir de argumentos ou variáveis de ambiente."""
 
         env = os.environ
-        u = user or env.get("THREEC_USER")
-        p = password or env.get("THREEC_PASSWORD")
+        # Preferir padrão THREECPLUS_*; manter compatibilidade leve com THREEC_*
+        u = user or env.get("THREECPLUS_USERNAME") or env.get("THREEC_USER")
+        p = password or env.get("THREECPLUS_PASSWORD") or env.get("THREEC_PASSWORD")
         cid_raw = (
-            company_id if company_id is not None else env.get("THREEC_COMPANY_ID")
+            company_id if company_id is not None else env.get("THREECPLUS_COMPANY_ID") or env.get("THREEC_COMPANY_ID")
         )
-        domain = company_domain or env.get("THREEC_COMPANY_DOMAIN")
+        domain = company_domain or env.get("THREECPLUS_COMPANY_DOMAIN") or env.get("THREEC_COMPANY_DOMAIN")
 
         cid_int: Optional[int]
         try:
@@ -123,12 +136,14 @@ class ThreeCAuthClient:
         except (TypeError, ValueError):
             cid_int = None
 
-        if not (u and p and cid_int is not None and domain):
+        # Credenciais mínimas: username/password. company_id/domain são opcionais por tenant.
+        if not (u and p):
             raise InputInvalid(
-                "Credenciais incompletas. Defina variáveis de ambiente ou passe por parâmetro."
+                "Credenciais incompletas (username/password). Defina no .env ou passe por parâmetro."
             )
 
-        return Credentials(u, p, cid_int, domain)
+        # Se não houver company_id/domain, usar valores neutros (0 e "")
+        return Credentials(u, p, cid_int or 0, domain or "")
 
     def _extract_token(self, data: Dict[str, Any]) -> Optional[str]:
         """Extrai o token da resposta de autenticação."""
@@ -164,14 +179,23 @@ class ThreeCAuthClient:
     ) -> str:
         """Realiza login e armazena o token em memória."""
 
+        # Se houver token pré-carregado do ambiente e não foram passadas credenciais, não relogar
+        if self._token and not (user or password):
+            self.logger.info("Login ignorado: token presente em ambiente")
+            return self._token
+
         creds = self._get_credentials(user, password, company_id, company_domain)
         url = f"{self.base_url}/authenticate"
+        # Tenants variam: maioria aceita {username,password}; manter compatibilidade com {user,company_*}
         payload = {
-            "user": creds.user,
+            "username": creds.user,
             "password": creds.password,
-            "company_id": creds.company_id,
-            "company_domain": creds.company_domain,
         }
+        # Se houver dados de company, enviar também
+        if creds.company_id:
+            payload["company_id"] = creds.company_id
+        if creds.company_domain:
+            payload["company_domain"] = creds.company_domain
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):

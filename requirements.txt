@@ -1,9 +1,0 @@
-mypy
-pandas
-pyodbc
-python-dotenv
-pytest
-pytest-cov
-requests
-requests-mock
-ruff
