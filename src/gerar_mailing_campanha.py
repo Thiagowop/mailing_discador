@@ -328,19 +328,22 @@ print(f"Gerando arquivos CSV por campanha: {total_campanhas}")
 logger.info("Gerando arquivos CSV por campanha: %s", total_campanhas)
 if total_campanhas > 0:
     atualizar_barra(0, total_campanhas, prefixo="Gerando CSVs")
-for idx, (campanha, grupo) in enumerate(df.groupby('CAMPANHA'), start=1):
+for idx, (campanha, grupo_original) in enumerate(df.groupby('CAMPANHA'), start=1):
+    # Resetar os índices para evitar desalinhamento na concatenação
+    grupo = grupo_original.reset_index(drop=True)
     mailing_base = pd.DataFrame({
         'COD': grupo['CPFCNPJ_CLIENTE'],
         'CPFCNPJ CLIENTE': grupo['CPFCNPJ_CLIENTE'],
         'NOME / RAZAO SOCIAL': grupo['NOME_RAZAO_SOCIAL'],
         'CAMPANHA': grupo['CAMPANHA']
-    })
+    }).reset_index(drop=True)
 
     telefones_expandidos = grupo.apply(preencher_telefones, axis=1)
     telefones_df = pd.DataFrame(
         telefones_expandidos.tolist(),
         columns=[f'TELEFONE_{i}' for i in range(1, 21)]
-    )
+    ).reset_index(drop=True)
+
     mailing = pd.concat([mailing_base, telefones_df], axis=1).copy()
     mailing = mailing.drop_duplicates(subset=['COD'])
 

@@ -19,7 +19,6 @@
 │   ├── utils/                    # 🛠️ Utilitários
 │   │   ├── __init__.py
 │   │   ├── barra.py            # Barra de progresso
-│   │   └── extracao_bases.py   # Funções de extração SQL
 │   │
 │   ├── __init__.py
 │   ├── gerar_mailing_campanha.py     # 📋 Gera CSVs por campanha
@@ -139,11 +138,6 @@ OUTPUT_RESUMO=1
 - Barra de progresso para console
 - Spinner para operações longas
 - Configurável via variáveis de ambiente
-
-### `src.utils.extracao_bases`
-- Funções para carregar dados do SQL Server
-- Parsing de CSVs com separador ";"
-- Tratamento de encoding UTF-8
 
 ### `src.pipeline_cli`
 - Interface de linha de comando

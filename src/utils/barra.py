@@ -115,6 +115,6 @@ def parar_spinner(token: Optional[Tuple[threading.Event, threading.Thread, str]]
         th.join(timeout=2.0)
     except Exception:
         pass
-    texto = mensagem_conclusao or f"{msg} concluído"
-    sys.stdout.write(f"\r{texto} ✓\n")
+    texto = mensagem_conclusao or f"{msg} concluido"
+    sys.stdout.write(f"\r{texto} [OK]\n")
     sys.stdout.flush()

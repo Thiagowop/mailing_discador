@@ -13,8 +13,8 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
+import unicodedata
 
 import requests  # type: ignore[import-untyped]
 from requests import Response, Session  # type: ignore[import-untyped]
@@ -28,11 +28,10 @@ from .auth import (
     Unauthorized,
 )
 from dotenv import load_dotenv
-from ..utils.extracao_bases import carregar_contatos_csv_semicolon
 from datetime import datetime
 import csv
 import io
- 
+
 
 
 # ---------------------------------------------------------------------------
@@ -58,40 +57,6 @@ class UploadFailed(ThreeCMailingError):
 
 class WeightUpdateFailed(ThreeCMailingError):
     """Falha ao atualizar peso do mailing."""
-
-
-# ---------------------------------------------------------------------------
-# Estruturas de dados
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Contact:
-    """Representa um contato a ser enviado para a API."""
-
-    name: Optional[str] = None
-    document: Optional[str] = None
-    phones: List[str] = field(default_factory=list)
-    email: Optional[str] = None
-    external_id: Optional[str] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:  # validações simples
-        if len(self.phones) > 20:
-            raise ValueError("Cada contato pode conter no máximo 20 telefones")
-        self.phones = [str(p) for p in self.phones]
-
-    def to_dict(self) -> Dict[str, Any]:
-        data: Dict[str, Any] = {
-            "name": self.name,
-            "document": self.document,
-            "phones": self.phones,
-            "email": self.email,
-            "external_id": self.external_id,
-        }
-        data.update(self.extra)
-        # Remove chaves com valor None
-        return {k: v for k, v in data.items() if v is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -392,53 +357,6 @@ class ThreeCMailingClient:
 
     # Fluxos apenas por CSV; funcionalidades de JSON foram removidas.
 
-    def enviar_mailing_csv(
-        self,
-        mailing_id: int,
-        caminho_csv: str,
-        *,
-        colmap: Dict[str, str] | None = None,
-    ) -> Dict[str, Any]:
-        """Fluxo legado de upload de CSV diretamente para um mailing existente."""
-        if not os.path.exists(caminho_csv):
-            raise UploadFailed("Arquivo CSV n�o encontrado")
-
-        with open(caminho_csv, "rb") as fh:
-            arquivo = (os.path.basename(caminho_csv), fh, "text/csv")
-            candidatos = [p.lstrip("/") for p in self.endpoints.get("enviar_csv", [])]
-            ultima_resposta: Response | None = None
-
-            for caminho in candidatos:
-                relativo = caminho.format(mailing_id=mailing_id)
-                url = f"{self.base_url}/{relativo}".replace(" ", "/")
-                headers = {"Idempotency-Key": str(uuid.uuid4())}
-                usar_payload_id = "{mailing_id}" not in caminho
-                data_form = {"mailing_id": str(mailing_id)} if usar_payload_id else None
-                if colmap and data_form is not None:
-                    data_form.update(colmap)
-
-                try:
-                    resp = self.session.request(
-                        "POST",
-                        url,
-                        files={"file": arquivo},
-                        data=data_form,
-                        headers=headers,
-                        timeout=self.timeout,
-                    )
-                    ultima_resposta = resp
-                except Exception:
-                    continue
-
-                if resp.status_code == 404:
-                    continue
-                if resp.status_code in (200, 201):
-                    return self._handle_response(resp, "enviar_csv")
-
-            if ultima_resposta is not None:
-                return self._handle_response(ultima_resposta, "enviar_csv")
-            raise CampaignNotFound("Endpoint enviar_csv n�o encontrado")
-
     def criar_mailing_por_csv_em_campanha(
         self,
         campaign_id: int,
@@ -460,6 +378,31 @@ class ThreeCMailingClient:
 
         # Tentar gerar CSV sanitizado com colunas aceitas pela API
         # Saída: identifier,Nome,Cpf,areacodephone
+        def _normalizar(texto: str) -> str:
+            return (
+                unicodedata.normalize("NFKD", texto or "")
+                .encode("ascii", "ignore")
+                .decode("ascii")
+                .strip()
+                .upper()
+            )
+
+        def _split_ddd_phone(raw: str) -> Optional[tuple[str, str, str]]:
+            """Extrai DDD e telefone (sem DDI) de uma string de telefone."""
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if not digits:
+                return None
+            if digits.startswith("55") and len(digits) > 11:
+                digits = digits[2:]
+            if len(digits) < 10:
+                return None
+            ddd = digits[:2]
+            numero = digits[2:]
+            if len(numero) < 7:
+                return None
+            combinado = f"{ddd}{numero}"
+            return combinado, ddd, numero
+
         def _csv_sanitizado_bytes(path: str) -> Optional[bytes]:
             try:
                 with open(path, "r", encoding="utf-8-sig") as fh:
@@ -469,24 +412,28 @@ class ThreeCMailingClient:
                 primeira = linhas[0]
                 sep = ";" if ";" in primeira else ","
                 cabecalho = [c.strip() for c in primeira.split(sep)]
+                cabecalho_norm = [_normalizar(c) for c in cabecalho]
 
-                def _idx(nome: str) -> int:
-                    try:
-                        return cabecalho.index(nome)
-                    except ValueError:
-                        return -1
+                def _idx(*nomes: str) -> int:
+                    for nome in nomes:
+                        nome_norm = _normalizar(nome)
+                        try:
+                            return cabecalho_norm.index(nome_norm)
+                        except ValueError:
+                            continue
+                    return -1
 
                 i_cod = _idx("COD")
-                i_nome = _idx("NOME / RAZAO SOCIAL")
-                i_cpf = _idx("CPFCNPJ CLIENTE")
-                i_phones = [_idx(f"TELEFONE_{i}") for i in range(1, 21)]
+                i_nome = _idx("NOME / RAZAO SOCIAL", "NOME / RAZÃO SOCIAL", "NOME/RAZAO SOCIAL", "NOME/RAZÃO SOCIAL")
+                i_cpf = _idx("CPFCNPJ CLIENTE", "CPF/CNPJ CLIENTE", "CPFCNPJ")
+                i_phones = [_idx(f"TELEFONE_{i}", f"TELEFONE {i}") for i in range(1, 21)]
                 i_phones = [i for i in i_phones if i >= 0]
 
                 if i_cod < 0 or i_nome < 0 or i_cpf < 0 or not i_phones:
                     return None
 
-                # Adequa ao formato aceito pelo endpoint CSV: identifier + areacodephone
-                saida = ["identifier,areacodephone"]
+                # Adequa ao formato aceito pelo endpoint CSV: identifier + telefone sanitizado
+                saida = ["identifier,areacodephone,ddd,phone"]
                 max_idx = max(i_cod, i_nome, i_cpf, max(i_phones))
                 for linha in linhas[1:]:
                     if not linha.strip():
@@ -503,11 +450,11 @@ class ThreeCMailingClient:
                             break
                     if not telefone:
                         continue
-                    # somente dígitos
-                    telefone_digitos = "".join(ch for ch in telefone if ch.isdigit())
-                    if not telefone_digitos:
+                    splitado = _split_ddd_phone(telefone)
+                    if not splitado:
                         continue
-                    saida.append(f"{cod},{telefone_digitos}")
+                    combinado, ddd, numero = splitado
+                    saida.append(f"{cod},{combinado},{ddd},{numero}")
                 if len(saida) == 1:
                     return None
                 return ("\n".join(saida) + "\n").encode("utf-8")
@@ -525,6 +472,12 @@ class ThreeCMailingClient:
         ]
 
         sanitized = _csv_sanitizado_bytes(caminho_csv)
+        if sanitized is not None:
+            try:
+                linhas_csv = max(sanitized.decode("utf-8").count("\n") - 1, 0)
+                self.logger.info("CSV sanitizado gerado com %s registros validos", linhas_csv)
+            except Exception:
+                pass
         last_resp: Response | None = None
         # tentar obter token para query param (Fluxoti exige api_token)
         api_token: Optional[str] = None
@@ -537,39 +490,40 @@ class ThreeCMailingClient:
         for path in candidates:
             url = f"{self.base_url}/{path}".replace(" ", "/")
             headers = {"Idempotency-Key": str(uuid.uuid4())}
-            data = {"name": filename or os.path.basename(caminho_csv)}
-            # parâmetros do formulário conforme documentação Fluxoti
-            data.update({
-                "delimiter": '"',
+            data = {
+                "name": filename or os.path.splitext(os.path.basename(caminho_csv))[0],
+                "delimiter": "quotes",
                 "has_header": "1",
-            })
+            }
+            # parâmetros do formulário conforme documentação Fluxoti
             # definir separador e header[i]
             header_items: Dict[str, str] = {}
-            separator_value = ","
-            try:
-                with open(caminho_csv, "r", encoding="utf-8-sig") as fh:
-                    first_line = fh.readline()
-                if ";" in first_line and "," not in first_line:
-                    separator_value = ";"
+            header_sequence: List[str] = []
+            if sanitized is not None:
+                header_sequence = ["identifier", "areacodephone", "areacode", "phone"]
+                header_items = {
+                    "header[0]": "identifier",
+                    "header[1]": "areacodephone",
+                    "header[2]": "areacode",
+                    "header[3]": "phone",
+                }
+                data["separator"] = ","
+            else:
+                try:
+                    with open(caminho_csv, "r", encoding="utf-8-sig") as fh:
+                        first_line = fh.readline()
                     cols = [c.strip() for c in first_line.split(";")]
-                else:
-                    separator_value = ","
-                    cols = [c.strip() for c in first_line.split(",")]
-                # Mapear cabeçalhos reais -> semântica (identifier, areacodephone, name, document, ...)
-                for idx, col in enumerate(cols):
-                    sem = (colmap or {}).get(col)
-                    if sem:
-                        header_items[f"header[{idx}]"] = sem
-            except Exception:
-                # se usamos CSV sanitizado, declarar cabeçalho conhecido
-                if sanitized is not None:
-                    cols = ["identifier", "areacodephone"]
-                    separator_value = ","
+                    data["separator"] = ";"
                     for idx, col in enumerate(cols):
-                        header_items[f"header[{idx}]"] = col
+                        sem = (colmap or {}).get(col)
+                        if not sem:
+                            continue
+                        header_items[f"header[{idx}]"] = sem
+                        header_sequence.append(sem)
+                except Exception:
+                    data["separator"] = ";"
             if header_items:
                 data.update(header_items)
-            data["separator"] = separator_value
             try:
                 self.logger.info(
                     "Upload CSV: tentando %s (sanitized=%s)",
@@ -582,7 +536,7 @@ class ThreeCMailingClient:
                 # caminho com CSV sanitizado em memória
                 files = {
                     ("mailing"): (
-                        filename or os.path.basename(caminho_csv),
+                        filename or os.path.splitext(os.path.basename(caminho_csv))[0],
                         io.BytesIO(sanitized),
                         "text/csv",
                     )
@@ -628,7 +582,7 @@ class ThreeCMailingClient:
                 # caminho lendo arquivo CSV original
                 try:
                     with open(caminho_csv, "rb") as f:
-                        files = {"mailing": (filename or os.path.basename(caminho_csv), f, "text/csv")}
+                        files = {"mailing": (filename or os.path.splitext(os.path.basename(caminho_csv))[0], f, "text/csv")}
                         resp = self.session.request(
                             "POST", url, files=files, data=data, headers=headers, timeout=self.timeout,
                             params={"api_token": api_token} if api_token else None,
@@ -908,26 +862,94 @@ def _normalizar_nome_campanha(nome: str) -> str:
 def _encontrar_csv_campanha(base_dir: str, campanha: str) -> str | None:
     if not os.path.isdir(base_dir):
         return None
-    alvo = _normalizar_nome_campanha(campanha)
+    
+    # Tentar importar o mapeamento de mailings
+    try:
+        from src.config_mailing import MAILING_MAP
+        numero_mailing = MAILING_MAP.get(campanha)
+    except ImportError:
+        numero_mailing = None
+    
     candidatos: list[tuple[str, float]] = []
     for fname in os.listdir(base_dir):
         if not fname.lower().endswith(".csv"):
             continue
-        if _normalizar_nome_campanha(campanha) in _normalizar_nome_campanha(fname):
+        
+        # Se tem número mapeado, buscar especificamente por ele
+        if numero_mailing is not None:
+            if fname.startswith(f"Mailing {numero_mailing:06d} -"):
+                fpath = os.path.join(base_dir, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except Exception:
+                    mtime = 0.0
+                candidatos.append((fpath, mtime))
+        # Fallback: busca pelo nome da campanha (comportamento original)
+        elif _normalizar_nome_campanha(campanha) in _normalizar_nome_campanha(fname):
             fpath = os.path.join(base_dir, fname)
             try:
                 mtime = os.path.getmtime(fpath)
             except Exception:
                 mtime = 0.0
             candidatos.append((fpath, mtime))
+    
     if not candidatos:
         return None
     # Escolher o mais recente
     candidatos.sort(key=lambda x: x[1], reverse=True)
     return candidatos[0][0]
 
-# Extração desacoplada
-# Função agora importada de src/extracao_bases.py: carregar_contatos_csv_semicolon
+def _encontrar_csvs_campanha(base_dir: str, campanha: str) -> list[str]:
+    """Encontra um ou mais arquivos CSV para uma campanha.
+
+    Regras:
+    - Se houver mapeamento por número (int) em MAILING_MAP, aceita também lista de inteiros.
+    - Para cada número, escolhe o arquivo mais recente com prefixo "Mailing {numero:06d} -".
+    - Se não houver mapeamento, cai no comportamento antigo por nome (retorna no máximo 1).
+
+    Retorna lista de caminhos completos existentes (pode ser vazia).
+    """
+    if not os.path.isdir(base_dir):
+        return []
+
+    numeros: list[int] | None = None
+    try:
+        from src.config_mailing import MAILING_MAP  # type: ignore
+        valor = MAILING_MAP.get(campanha)
+        if isinstance(valor, int):
+            numeros = [valor]
+        elif isinstance(valor, list) and all(isinstance(n, int) for n in valor):
+            numeros = list(valor)
+        else:
+            numeros = None
+    except Exception:
+        numeros = None
+
+    resultados: list[str] = []
+
+    # Caso novo: iterar por números
+    if numeros:
+        for num in numeros:
+            candidatos: list[tuple[str, float]] = []
+            prefixo = f"Mailing {num:06d} -"
+            for fname in os.listdir(base_dir):
+                if not fname.lower().endswith(".csv"):
+                    continue
+                if fname.startswith(prefixo):
+                    fpath = os.path.join(base_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                    except Exception:
+                        mtime = 0.0
+                    candidatos.append((fpath, mtime))
+            if candidatos:
+                candidatos.sort(key=lambda x: x[1], reverse=True)
+                resultados.append(candidatos[0][0])
+        return resultados
+
+    # Fallback: comportamento antigo (por nome, máximo 1)
+    unico = _encontrar_csv_campanha(base_dir, campanha)
+    return [unico] if unico else []
 
 
 def main() -> None:
@@ -1049,7 +1071,7 @@ def main() -> None:
             base_csv = os.path.splitext(os.path.basename(csv_path))[0]
         except Exception:
             base_csv = os.path.basename(csv_path)
-        lista_nome_unico = f"Mailing {nome} - {base_csv} - {datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        lista_nome_unico = os.path.splitext(base_csv)[0]
         # Idempotência: inativar listas existentes antes de criar nova
         resetar = str(os.getenv("THREECPLUS_RESET_LISTAS", "0")).lower() in ("1", "true", "yes")
         if resetar and not dry_run:

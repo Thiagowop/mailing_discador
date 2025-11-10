@@ -1,141 +1,190 @@
-# Integração 3C Plus – Guia Técnico e Operacional
+# Integracao 3C Plus - Manual Tecnico e Operacional
 
-## Visão Geral
+Este documento descreve toda a integracao com a API da 3C Plus: configuracao, fluxos, funcoes existentes, pontos de monitoramento e procedimentos de manutencao. A intencao e permitir que qualquer pessoa consiga operar, evoluir ou depurar o pipeline sem depender de conhecimento tacito.
 
-Este projeto executa o ciclo completo de atualização das campanhas do discador 3C Plus a partir de dados extraídos do banco **Candiotto_std**. O fluxo principal remove listas antigas das campanhas-alvo, gera novos mailings em CSV e realiza o upload via API.
+## Objetivo do projeto
 
-### Fluxograma do Pipeline
+- Extrair mailings do banco **Candiotto_std**, higienizar os dados e gerar CSVs padronizados.
+- Remover listas antigas no discador 3C Plus e publicar as novas listas de forma automatizada.
+- Disponibilizar ferramentas para operadores tecnicos acompanharem Rodadas, consultas e logs.
+
+## Arquitetura geral
+
+| Camada | Arquivo / Script | Papel | Entrada / Saida |
+| --- | --- | --- | --- |
+| Autenticacao API | `src/threec/auth.py` | Obtem e renova tokens via `login`. | `.env` + API 3C Plus. |
+| Cliente de mailing | `src/threec/mailing_client.py` | Lista campanhas, deleta listas, faz upload CSV, ajusta peso e registra logs. | CSVs higienizados / respostas API. |
+| Extracao | `src/gerar_mailing_campanha.py` e `src/gerar_mailing_negociador.py` | Executam as consultas no SQL Server e gravam `data/campanhas/*.csv`. | Banco -> CSV. |
+| Utilitarios | `src/utils/barra.py` | Barra de progresso e spinner para dar feedback visual nas extrações. | Events -> console. |
+| Orquestrador CLI | `src/pipeline_cli.py` | Comandos para limpar, alimentar, validar e testar conexoes. Usado pelos `.bat`. | Operador -> API + logs. |
+| Scripts Windows | `fluxo_completo.bat`, `pipeline_fluxo.bat` | Automacoes clicaveis para o time operacional. | CLI -> stdout/logs. |
+| Mapeamento | `src/config_mailing.py` | Relaciona nomes de campanha x numero de mailing nos arquivos CSV. | Nome 3C+ -> prefixo `Mailing 000123 - ...`. |
+
+## Fluxo ponta a ponta
 
 ```mermaid
 flowchart TD
-    A[fluxo_completo.bat / pipeline opção 1] --> B[Limpar CSVs locais]
-    B --> C[Gerar mailings (src/gerar_mailing_campanha.py)]
-    C --> D[Atualizar listas no 3C Plus]
-    D --> E{Sucesso?}
-    E -- Não --> F[Logs + retorno de erro]
-    E -- Sim --> G[Relatório em console]
+    A[Operador / Scheduler] --> B[pipeline_fluxo.bat ou fluxo_completo.bat]
+    B --> C[Scripts de extracao (gerar_mailing_*.py)]
+    C --> D[data/campanhas/*.csv + logs]
+    D --> E[pipeline_cli atualizar-listas]
+    E --> F[ThreeCAuthClient -> login/token]
+    F --> G[ThreeCMailingClient: listar/deletar/upload/ajustar peso]
+    G --> H[Campanhas atualizadas + logs/info em console]
+    H --> I[Monitoramento em logs/3cplus.log e logs/error.log]
 ```
 
-## Configuração do Ambiente
+## Configuracao do ambiente
 
-- Copie `.env.template` para `.env` e preencha as credenciais do banco, URL/Base da API e usuário/senha ou token.
-- **Campanhas-alvo:** configure `THREECPLUS_TARGET_CAMPAIGNS` com uma lista separada por vírgulas. Exemplo:
+### Passos iniciais
 
-  ```ini
-  THREECPLUS_TARGET_CAMPAIGNS=RSF Judicial, Direcional Judicial
-  ```
+1. `cp .env.template .env`.
+2. Preencha as credenciais de banco (prefixo `DB_`) e as configuracoes da 3C Plus.
+3. Defina o diretorio de logs se necessario (`LOG_DIR`, default `logs`) e garanta que existe.
+4. Crie as pastas `data/campanhas` e `logs` se ainda nao existirem (os scripts assumem esse layout).
 
-  > Sempre utilize o nome exatamente como aparece no 3C Plus. A atualização considerará apenas essas campanhas.
+### Variaveis principais (.env)
 
-- Variáveis opcionais:
-  - `PIPELINE_LOG_LEVEL` – nível de log exibido no console (default: `WARNING`). Utilize `INFO` para depuração.
-  - `PROGRESS_BAR` e `PROGRESS_BAR_PERCENT` – controlam a exibição da barra de progresso (já habilitadas no fluxo).
+| Variavel | Descricao | Obrigatoria | Exemplo |
+| --- | --- | --- | --- |
+| `THREECPLUS_BASE_URL` | URL do tenant sem `/api/v1`. | Sim | `https://acme.3c.plus` |
+| `THREECPLUS_USERNAME` / `THREECPLUS_PASSWORD` | Credenciais do usuario operacional. | Sim | `operador@empresa` |
+| `THREECPLUS_COMPANY_ID` / `THREECPLUS_COMPANY_DOMAIN` | Identificadores complementares exigidos por alguns tenants (quando a API valida multi-empresa). | Opcional | `123`, `empresa` |
+| `THREECPLUS_API_TOKEN` | Token pronto para uso (substitui login). So use se o tenant permitir tokens long-lived. | Opcional | `eyJhbGciOi...` |
+| `THREECPLUS_TARGET_CAMPAIGNS` | Lista (separada por virgula) das campanhas que o pipeline deve processar em cada execucao. | Sim | `RSF Judicial, Direcional Judicial` |
+| `LOG_DIR` e `LOG_LEVEL` | Controlam onde e em qual nivel os logs sao gravados. | Opcional | `logs`, `INFO` |
+| `PROGRESS_BAR` e `PROGRESS_BAR_PERCENT` | Habilitam barra textual nas geracoes (`1` para ativar). | Opcional | `1`, `1` |
+| `DB_*` | Conexao SQL Server (driver, servidor, banco, usuario, senha, opcional `DB_TRUST_CERT=1`). | Sim | vide template |
 
-## Módulos Principais
+> Valide o `.env` executando `python -m src.pipeline_cli mostrar-configuradas`. O comando carrega o arquivo e indica variaveis ausentes.
 
-### `src/extracao_bases.py`
-- Responsável por normalizar CSVs gerados pela extração com separador `;`.
-- Remove cabeçalho inválido, higieniza telefones e usa `src.barra` para indicar progresso.
+### Como adicionar ou remover campanhas
 
-### `src/threec/auth.py`
-- Cliente de autenticação. Carrega credenciais do `.env`, realiza login e mantém a sessão HTTP (`requests.Session`).
-- Lida com retries básicos e exceções customizadas (`Unauthorized`, `InputInvalid`, etc.).
+1. Confirme o nome exato da campanha no painel 3C Plus (respeite maiusculas/minusculas e espacos).
+2. Abra `.env` e edite `THREECPLUS_TARGET_CAMPAIGNS`, mantendo os nomes separados por virgula. Somente essas campanhas participam da limpeza/upload.
+3. Gere (ou copie) os CSVs correspondentes para `data/campanhas`. O nome esperado segue o padrao `Mailing 000074 - Nome - AAAA-MM-DD.csv`.
+4. Se a campanha ainda nao estiver em `src/config_mailing.py`, inclua o par `"Nome": numero`. Isso acelera a localizacao do CSV correto.
+5. Execute `pipeline_fluxo.bat 6` (listar campanhas) para verificar se o nome inserido aparece na API. Caso contrario, a etapa `atualizar-listas` vai registrar `Campanha nao encontrada`.
 
-### `src/threec/mailing_client.py`
-- Operações de alto nível sobre a API 3C Plus:
-  - `listar_campanhas()` com paginação automática.
-  - `listar_listas_da_campanha()`, `deletar_lista_da_campanha()`, `criar_mailing_por_csv_em_campanha()`.
-  - `enviar_mailing_csv()` (fluxo legado de 2 passos, mantido para compatibilidade).
-- Todos os logs ficam em `logs/3cplus.log` (INFO) e `logs/error.log` (ERROR).
+### Mapeamento de mailings (`src/config_mailing.py`)
 
-### `src/gerar_mailing_campanha.py`
-- Executa a consulta principal no SQL Server, aplica filtros (ex.: RO recente) e gera um CSV por campanha.
-- Mostra spinner durante a consulta e barra percentual ao gravar os arquivos.
-- Produz resumo dos arquivos gerados (quantidade e linhas).
+O dicionario `MAILING_MAP` associa o nome da campanha ao numero do mailing presente no prefixo dos arquivos CSV. A classe `ThreeCMailingClient` utiliza esse mapa em `_encontrar_csv_campanha` e `_encontrar_csvs_campanha` para:
 
-### `src/pipeline_cli.py`
-- Interface em Python acionada pelos `.bat`. Principais comandos:
-  - `limpar-csv` – limpa diretórios de mailings.
-  - `atualizar-listas` – remove listas antigas e envia CSVs novos (resumo final com sucessos/falhas).
-  - `limpar-listas`, `listar-campanhas`, `mostrar-configuradas`, `testar-conexao`.
-- Ajusta o nível de log do cliente para reduzir verbosidade no console.
+- Priorizar o arquivo cujo nome comeca com `Mailing {numero:06d} -`.
+- Aceitar multiplos numeros (lista de inteiros) quando uma campanha compartilha varios mailings.
+- Cair no modo antigo (busca por nome) se o numero nao for encontrado.
 
-### `fluxo_completo.bat`
-- Executa `limpar-csv`, gera mailings e roda `atualizar-listas` em sequência.
-- Mantém a janela aberta por 40 segundos (variável `WAIT_SECONDS`) para leitura do resultado.
+**Como atualizar o mapa:**
 
-### `pipeline_fluxo.bat`
-- Menu interativo (ou modo direto via argumento) com as seguintes opções:
-  1. Fluxo completo
-  2. Somente extração por campanha
-  3. Extração por negociador
-  4. Alimentar listas (sem nova extração)
-  5. Limpar listas
-  6. Listar campanhas no 3C Plus
-  7. Testar conexão com o banco
-  8. Exibir campanhas configuradas e disponíveis
-  9. Sair
-- Sempre retorna ao menu após `pause`.
+1. Abra `src/config_mailing.py`.
+2. Adicione o par `"Nome exato da campanha": 74`.
+3. Para campanhas com variantes (ex.: extrajudicial/judicial com mailings diferentes), use comentarios explicando. Se forem multiplos IDs, utilize uma lista: `"Campanha X": [74, 83]`.
+4. Salve e, opcionalmente, rode `python testes\\testar_mapeamento.py` para validar a numeracao.
 
-## Execução e Operação
+## Modulos e responsabilidades
 
-### Via Script (Windows)
+### Autenticacao (`src/threec/auth.py`)
 
-```bat
-:: Fluxo completo (gera CSV + atualiza campanhas)
-fluxo_completo.bat
+- `ThreeCAuthClient` carrega o `.env`, monta `base_url/api/v1` e inicializa uma `requests.Session`.
+- `login` tenta autenticar ate `max_retries` (default 3), tratando `Timeout`, `RateLimitExceeded`, `ApiUnavailable` e `InvalidCredentials`.
+- Mantem o token em memoria; se `THREECPLUS_API_TOKEN` estiver no `.env`, ja configura o header `Authorization`.
+- Oferece helpers como `logout`, `refresh_token` (quando vastro), e normaliza excecoes (`Unauthorized`, `TokenExpired`, `InputInvalid`).
+- Todos os erros relevantes sao enviados ao logger (nome `ThreeCAuthClient`), que por padrao escreve em `logs/3cplus.log`.
 
-:: Menu interativo
-pipeline_fluxo.bat
+### Cliente de mailing (`src/threec/mailing_client.py`)
 
-:: Execução direta de uma opção (exemplo: alimentar listas)
-pipeline_fluxo.bat 4
-```
+`ThreeCMailingClient` encapsula tudo que toca em listas/campanhas.
 
-### Via n8n (planejado)
+- **Endpoints dinamicos:** `DEFAULT_ENDPOINTS` guarda possiveis rotas (com e sem `/agent` ou `/api/v1`). `_resolve_endpoint` percorre ate encontrar um caminho que responda (`HTTP 2xx`). Isso evita edicoes ad-hoc quando o tenant muda.
+- **Operacoes principais:**
+  - `listar_campanhas(filtro, somente_ativas)` pagina automaticamente e remove duplicados.
+  - `listar_listas_da_campanha(campaign_id)` retorna a representacao crua da API (a funcao chama diferentes chaves `data`, `lists`, `items`).
+  - `deletar_lista_da_campanha(campaign_id, list_id)` remove listas antigas antes do upload.
+  - `criar_mailing_por_csv_em_campanha(campaign_id, caminho_csv, filename, header, colmap)` realiza o fluxo oficial (upload CSV direto na campanha) e tenta sanitizar o arquivo para o cabecalho `identifier,areacodephone,ddd,phone`. Telefone e higienizado por `_split_ddd_phone`.
+  - `atualizar_lista_por_csv`, `inativar_todas_listas_da_campanha` e `ajustar_peso_mailing` garantem que a lista nova fica ativa e com peso definido.
+- **Utilitarios internos:** `_encontrar_csv_campanha`, `_encontrar_csvs_campanha` e `_normalizar_nome_campanha` conectam `MAILING_MAP` aos arquivos em `data/campanhas`.
+- **Logs e resiliencia:** cada requisicao cria um `Idempotency-Key`, a sessao reusa cookies e toda resposta e validada por `_handle_response` (gera `UploadFailed`, `CreateMailingFailed` etc. quando necessario).
 
-- A automação n8n ainda não foi implementada.
-- Próximos passos sugeridos:
-  1. Criar workflow que invoque `fluxo_completo.bat` via `Execute Command`.
-  2. Capturar logs e status de saída para envio (e-mail/Slack).
-  3. Parametrizar `THREECPLUS_TARGET_CAMPAIGNS` em variáveis do n8n ou secrets manager.
+### Pipeline CLI (`src/pipeline_cli.py`)
 
-## Formato dos Dados
+Interface usada pelos scripts `.bat` e tambem acessivel direto via `python -m src.pipeline_cli <comando>`.
 
-- **Entrada SQL**: consulta consolidada via `src/gerar_mailing_campanha.py` agrupa dados por campanha.
-- **CSV gerado**:
-  - Colunas fixas: `COD`, `CPFCNPJ CLIENTE`, `NOME / RAZAO SOCIAL`, `CAMPANHA`.
-  - Telefones: `TELEFONE_1`…`TELEFONE_20`.
-  - Separador `;`, encoding `utf-8-sig`.
-- **Upload 3C Plus**:
-  - Cabeçalho sanitizado para `identifier,name,document,areacodephone`.
-  - Endpoints testados: `api/v1/campaigns/{id}/lists/csv`, `api/v1/agent/...`, `api/v1/campaigns/{id}/mailing`.
+Principais comandos:
 
-## Monitoramento e Logs
+- `limpar-csv <pasta...>`: exclui arquivos `.csv` dos diretorios informados.
+- `atualizar-listas --diretorio-csv data/campanhas`: para cada campanha configurada, remove as listas existentes e envia os CSVs atualizados. Gera um resumo (sucesso, falha de delecao, CSV ausente).
+- `limpar-listas`: apenas apaga listas das campanhas configuradas.
+- `listar-campanhas`: imprime as campanhas retornadas pela API (nome, id, status).
+- `mostrar-configuradas`: compara as campanhas do `.env` com as existentes na API.
+- `validar-listas [--campanha NOME | --todas]`: consulta as listas e conta registros.
+- `atualizar-campanha --nome "Campanha" [--csv caminho]`: upload direcionado, ignorando `THREECPLUS_TARGET_CAMPAIGNS`.
+- `testar-conexao`: faz um `select 1` via `pyodbc` com as credenciais do `.env`.
 
-- `logs/3cplus.log`: tentativas de upload, status HTTP, transaction_id.
-- `logs/error.log`: exceções não tratadas/erros de API.
-- Consoles dos `.bat`: resumo final (listas removidas, campanhas atualizadas).
-- Ajuste `PIPELINE_LOG_LEVEL=INFO` para diagnosticar problemas diretamente no console.
+O helper `_criar_cliente_mailing` instancia `ThreeCAuthClient` + `ThreeCMailingClient` e reduz o log no console conforme `PIPELINE_LOG_LEVEL`.
 
-## Troubleshooting
+### Geracao de arquivos (`src/gerar_mailing_campanha.py` e `src/gerar_mailing_negociador.py`)
 
-| Sintoma | Possível causa | Como agir |
+- Executam stored procedures/consultas no SQL Server, com filtros de data e status definidos no codigo.
+- Convertem o resultado em CSV com separador `;`, encoding `utf-8-sig` e colunas padronizadas (`COD`, `CPFCNPJ CLIENTE`, `NOME / RAZAO SOCIAL`, `TELEFONE_1...20`, `CAMPANHA`).
+- Utilizam `utils.barra` para exibir progresso textual e respeitam `PROGRESS_BAR` / `PROGRESS_BAR_PERCENT`.
+- Geram estatisticas ao final (tempo, numero de linhas por campanha).
+
+### Utilitarios (`src/utils`)
+
+- `barra.py`: implementa barra de progresso e spinner modular, permitindo habilitar/desabilitar via ambiente.
+
+### Scripts em lote
+
+- `fluxo_completo.bat`: sequencia automatica `limpar-csv -> gerar_mailing_campanha -> pipeline_cli atualizar-listas`. No final aguarda ~40s (`WAIT_SECONDS`) antes de fechar a janela.
+- `pipeline_fluxo.bat`: menu numerico com nove opcoes (fluxo completo, extracoes isoladas, alimentar listas, limpar listas, listar campanhas, testar conexao, mostrar configuradas, sair). Tambem aceita um argumento (`pipeline_fluxo.bat 4`) para acionar direto uma opcao.
+
+### Testes e validacoes auxiliares (`/testes`)
+
+- `testar_mapeamento.py` e `mapear_campanhas_faltantes.py` ajudam a manter `MAILING_MAP` sincronizado com a 3C Plus.
+
+## Dados e formatos
+
+- **Consulta SQL:** gera um CSV por campanha com colunas fixas. Telefones ocupam 20 campos (vazios quando nao utilizados).
+- **CSV sanitizado para upload:** `ThreeCMailingClient` converte para `identifier,areacodephone,ddd,phone`. O `identifier` recebe `COD` e o telefone e truncado para remover DDI, caracteres nao numericos e garantir DDD+numero.
+- **Diretorios padrao:** `data/campanhas` (campanhas), `data/negociadores` (quando aplicavel), `logs` (saida do logger). Se outro caminho for desejado, passe via argumentos do CLI (`--diretorio-csv`).
+
+## Logs e monitoramento
+
+- `logs/3cplus.log`: informacoes operacionais (login, endpoints utilizados, quantidade de registros, status HTTP).
+- `logs/error.log`: stack traces e erros que interrompem o fluxo.
+- `run_output.log`: historico das ultimas execucoes (gerado pelos .bat).
+- Console dos scripts `.bat`: mostra barras de progresso, IDs de campanha/lista, contagem de registros removidos/adicionados.
+- Ajuste `LOG_LEVEL=DEBUG` ou `PIPELINE_LOG_LEVEL=INFO` para detalhar mais quando necessario.
+
+## Troubleshooting rapido
+
+| Sintoma | Causa provavel | Solucao |
 | --- | --- | --- |
-| `ERRO: Python nao encontrado` | Python fora do PATH | Instalar/adicionar ao PATH |
-| `Variaveis ausentes no .env` | `.env` incompleto | Conferir credenciais e campanhas |
-| `Erro 401/403` | Credenciais inválidas ou sessão expirada | Revisar usuário/senha/token |
-| `Erro 422 "header obrigatório"` | CSV com cabeçalho inesperado | Verificar se a consulta gerou colunas padrão; usar arquivo do dia |
-| `Campanha nao encontrada` | Nome não bate com 3C Plus | Ajustar `THREECPLUS_TARGET_CAMPAIGNS` |
-| `Falha ao deletar lista` | API não permite exclusão ou timeout | Conferir logs detalhados (`logs/error.log`), tentar novamente |
+| `Variaveis ausentes no .env` | `.env` incompleto ou com nomes errados. | Reabra `pipeline_fluxo.bat 8` ou `mostrar-configuradas` para identificar e preencher. |
+| `Campanha nao encontrada` no `atualizar-listas` | Nome nao existe ou grafia diferente da API. | Copie exatamente como aparece em `listar-campanhas`; atualize `.env` e, se preciso, `MAILING_MAP`. |
+| `Arquivo CSV nao encontrado` | CSV nao gerado ou nome fora do padrao `Mailing XXXX -`. | Rode `gerar_mailing_campanha.py` novamente e verifique `data/campanhas`. |
+| `Erro 401/403` | Credenciais invalidas ou token expirado. | Refaça login (apague `THREECPLUS_API_TOKEN` se estiver desatualizado) e confirme `THREECPLUS_BASE_URL`. |
+| `Erro 422 header obrigatorio` | Cabecalho nao reconhecido / CSV vazio. | Abra o CSV e valide se possui `COD`, `CPFCNPJ`, `TELEFONE_1...`. Se faltar, revise a consulta SQL. |
+| `Falha ao deletar lista` | API recusou a exclusao ou houve timeout. | Reexecute o comando ou tente `pipeline_cli validar-listas --campanha "Nome"` para conferir o estado atual. |
+| `pyodbc nao encontrado` | Dependencia nao instalada no host. | Instale `pyodbc` (msiexec do ODBC Driver + `pip install pyodbc`) ou rode o comando em um ambiente que possua o driver. |
 
-## Manutenção Futura
+> Em qualquer falha, confira primeiro `logs/error.log`. A maioria das excecoes contem o `transaction_id` retornado pela 3C Plus, facilitando abrir um chamado com o suporte do discador.
 
-- Revisar periodicamente os endpoints na classe `ThreeCMailingClient` (a 3C Plus costuma introduzir variantes).
-- Se o número de campanhas-alvo crescer, considere paginar a geração dos CSVs para reduzir o tempo de consulta SQL.
-- Planejar a automação no n8n usando os scripts existentes (sem necessidade de refatorar).
-- Adicionar testes automatizados para o `pipeline_cli` conforme novas regras de negócio.
+## Procedimentos de manutencao
 
----
+- **Adicionar nova campanha:** atualizar `.env` e `src/config_mailing.py`, gerar CSV e testar com `pipeline_cli atualizar-campanha --nome "Campanha"`.
+- **Alterar formato dos CSVs:** adapte `src/gerar_mailing_campanha.py` e valide se `_csv_sanitizado_bytes` continua identificando as colunas obrigatorias (`COD`, `NOME`, `CPFCNPJ`, `TELEFONE_X`). Ajuste os indices se renomear campos.
+- **Atualizar endpoints:** caso a 3C Plus altere rotas, adicione novos caminhos a `DEFAULT_ENDPOINTS` no `ThreeCMailingClient` (mantendo o fallback existente).
+- **Revisar credenciais:** tokens e senhas devem ser atualizados sempre que o time de segurança solicitar. Aproveite `pipeline_cli listar-campanhas` para validar apos cada troca.
+- **Limpeza de logs:** `logs/3cplus.log` pode crescer. Utilize `powershell Clear-Content logs\\3cplus.log` (ou rotacione) periodicamente.
 
-**Contato rápido:** qualquer erro durante o fluxo completo é registrado no console (com retardo de 40s) e detalhado em `logs/error.log`. Utilize essas pistas antes de modificar o código.
+## Checklist operacional
+
+1. Conferir se as bases desejadas estao listadas em `THREECPLUS_TARGET_CAMPAIGNS`.
+2. Executar `pipeline_fluxo.bat 2` (ou script especifico) para gerar CSVs atualizados.
+3. Validar rapidamente o cabecalho dos arquivos (abrir 1 CSV e conferir colunas).
+4. Rodar `pipeline_fluxo.bat 4` (alimentar listas) ou `fluxo_completo.bat` para o ciclo completo.
+5. Ler o resumo exibido ao final (sucessos/falhas) e, em caso de erro, abrir `logs/error.log`.
+6. (Opcional) `pipeline_cli validar-listas --campanha "Nome"` para confirmar o total de registros ativos.
+
+Seguindo este manual, o time consegue configurar novas campanhas, operar o fluxo diario e executar troubleshootings basicos sem depender de alteracoes no codigo-fonte.

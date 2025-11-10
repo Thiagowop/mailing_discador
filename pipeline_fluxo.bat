@@ -24,10 +24,11 @@ echo 5) Limpeza de listas (apenas deletar listas das campanhas alvo)
 echo 6) Lista de campanhas no 3C+
 echo 7) Testar conexao com banco
 echo 8) Campanhas configuradas (.env)
-echo 9) Sair
+echo 9) Validar listas (registros no 3C+)
+echo 10) Sair
 echo.
 set "opt="
-set /p opt=Escolha uma opcao [1-9]:
+set /p opt=Escolha uma opcao [1-10]:
 if "%opt%"=="" goto menu
 
 :despachar
@@ -39,7 +40,8 @@ if "%opt%"=="5" goto limpar
 if "%opt%"=="6" goto listar
 if "%opt%"=="7" goto testar
 if "%opt%"=="8" goto configuradas
-if "%opt%"=="9" goto sair
+if "%opt%"=="9" goto validar
+if "%opt%"=="10" goto sair
 echo Opcao invalida: %opt%
 goto aguardar_e_menu
 goto menu
@@ -98,6 +100,10 @@ goto aguardar_e_menu
 
 :configuradas
 python -m src.pipeline_cli mostrar-configuradas
+goto aguardar_e_menu
+
+:validar
+python -m src.pipeline_cli validar-listas
 goto aguardar_e_menu
 
 :sair
